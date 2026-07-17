@@ -61,6 +61,30 @@ class TestDataDir:
         BlueArchiveGameFilesDownloader(data_dir=tmp_path)
         assert (tmp_path / "catalog.db").exists()
 
+    def test_db_path_overrides_data_dir(self, tmp_path):
+        db_dir = tmp_path / "db_elsewhere"
+        db_path = db_dir / "catalog.db"
+        d = BlueArchiveGameFilesDownloader(data_dir=tmp_path, db_path=db_path)
+        assert d.db_path == db_path
+        assert db_path.exists()
+        assert not (tmp_path / "catalog.db").exists()
+        assert d.zip_cache == tmp_path / "zip_cache"
+
+    def test_db_path_env_var(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "db_elsewhere" / "catalog.db"
+        monkeypatch.setenv("BAGFD_DB_PATH", str(db_path))
+        d = BlueArchiveGameFilesDownloader(data_dir=tmp_path)
+        assert d.db_path == db_path
+        assert db_path.exists()
+
+    def test_db_path_arg_overrides_env_var(self, tmp_path, monkeypatch):
+        env_path = tmp_path / "env" / "catalog.db"
+        arg_path = tmp_path / "arg" / "catalog.db"
+        monkeypatch.setenv("BAGFD_DB_PATH", str(env_path))
+        d = BlueArchiveGameFilesDownloader(data_dir=tmp_path, db_path=arg_path)
+        assert d.db_path == arg_path
+        assert not env_path.exists()
+
     def test_proxy_sets_session_proxies(self, tmp_path):
         d = BlueArchiveGameFilesDownloader(data_dir=tmp_path, proxy="http://proxy:8080")
         assert d.session.proxies == {'http': 'http://proxy:8080', 'https': 'http://proxy:8080'}

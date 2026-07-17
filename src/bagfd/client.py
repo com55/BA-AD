@@ -10,9 +10,11 @@ file-oriented operations, each scoped to a single platform:
 - `download` — download the latest matching files into a *user output
   directory* and return a `DownloadResult`.
 
-Storage layout (all under ``data_dir``, except the per-call download dirs):
+Storage layout (all under ``data_dir``, except the per-call download dirs and
+an optionally overridden catalog DB):
 
-- ``data_dir/catalog.db``       — the file catalog
+- ``data_dir/catalog.db``       — the file catalog (path overridable via ``db_path``,
+                                  e.g. to keep it off shared/network-backed storage)
 - ``data_dir/zip_cache/<plat>`` — cached JP zip packs (shared by download/get)
 - ``cache_dir/<plat>``          — files returned by `get_latest_files`
                                   (default ``data_dir/download_cache``)
@@ -60,12 +62,23 @@ class BlueArchiveGameFilesDownloader:
     """Download Blue Archive game files across the three supported platforms.
 
     Args:
-        data_dir: Fixed directory for the catalog DB and the JP zip cache.
-            Defaults to ``$BAGFD_DATA_DIR`` or ``platformdirs.user_data_dir("BAGFD")``.
+        data_dir: Fixed directory for the catalog DB (unless ``db_path`` is given)
+            and the JP zip cache. Defaults to ``$BAGFD_DATA_DIR`` or
+            ``platformdirs.user_data_dir("BAGFD")``.
+        db_path: Optional override for the catalog DB's file path, independent of
+            ``data_dir``. Defaults to ``$BAGFD_DB_PATH`` or ``data_dir/catalog.db``.
+            Use this to keep the DB off storage that doesn't support the POSIX file
+            locking SQLite's WAL mode relies on (e.g. a shared network volume),
+            while still sharing ``data_dir`` for the zip cache.
         proxy: Optional HTTP/HTTPS proxy URL applied to all requests.
     """
 
-    def __init__(self, data_dir: Path | None = None, proxy: str | None = None):
+    def __init__(
+        self,
+        data_dir: Path | None = None,
+        db_path: Path | None = None,
+        proxy: str | None = None,
+    ):
         if data_dir is None:
             env = os.environ.get("BAGFD_DATA_DIR")
             if env:
@@ -74,7 +87,11 @@ class BlueArchiveGameFilesDownloader:
                 from platformdirs import user_data_dir
                 data_dir = Path(user_data_dir("BAGFD"))
         self.data_dir = Path(data_dir)
-        self.db_path = self.data_dir / "catalog.db"
+
+        if db_path is None:
+            env = os.environ.get("BAGFD_DB_PATH")
+            db_path = Path(env) if env else self.data_dir / "catalog.db"
+        self.db_path = Path(db_path)
         self.zip_cache = self.data_dir / "zip_cache"
 
         self.session = requests.Session()
@@ -89,6 +106,7 @@ class BlueArchiveGameFilesDownloader:
             self.session.proxies = {'http': proxy, 'https': proxy}
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         init_database(self.db_path)
 
         self._update_locks: dict[str, threading.Lock] = {
