@@ -1,10 +1,12 @@
 """
 Unit tests for bagfd.client (BlueArchiveGameFilesDownloader) — no network required.
 """
+import hashlib
 import json
 import sqlite3
 import threading
 import zipfile
+import zlib
 from unittest.mock import patch
 
 import pytest
@@ -413,6 +415,81 @@ class TestClean:
         rows = conn.execute("SELECT COUNT(*) FROM global_android").fetchone()[0]
         conn.close()
         assert rows == 3
+
+
+# ---------------------------------------------------------------------------
+# update() — cache pruning on a catalog change
+# ---------------------------------------------------------------------------
+
+class TestUpdatePrunesCache:
+    """update() must keep cached files still valid after a catalog refresh,
+    evicting only what changed or dropped out — not a blanket wipe."""
+
+    def test_global_keeps_valid_evicts_stale(self, tmp_path):
+        c = BlueArchiveGameFilesDownloader(data_dir=tmp_path)
+        _seed_versions(c.db_path)
+
+        cache_dir = c.data_dir / "download_cache" / "global-android"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "keep.bundle").write_bytes(b"KEEP")
+        (cache_dir / "stale.bundle").write_bytes(b"STALE")
+
+        def fake_fetch(session, db_path, force=False, check_interval=None):
+            save_game_files(db_path, get_table_name("global-android"), [
+                ("Android/keep.bundle", "https://cdn/keep.bundle", "md5", hashlib.md5(b"KEEP").hexdigest(), 4, None),
+                # stale.bundle's catalog row is gone entirely (dropped from the catalog)
+            ])
+            return True
+
+        with patch('bagfd.client.fetch_global_android', side_effect=fake_fetch):
+            c.update(platform='global-android')
+
+        assert (cache_dir / "keep.bundle").exists()
+        assert not (cache_dir / "stale.bundle").exists()
+
+    def test_japan_hash_sweeps_zip_cache_but_clears_extracted_files(self, tmp_path):
+        c = BlueArchiveGameFilesDownloader(data_dir=tmp_path)
+        _seed_versions(c.db_path)
+
+        zip_dir = c.zip_cache / "japan-android"
+        zip_dir.mkdir(parents=True)
+        (zip_dir / "Pack_keep.zip").write_bytes(b"KEEP")
+        (zip_dir / "Pack_stale.zip").write_bytes(b"STALE")
+
+        extracted_dir = c.data_dir / "download_cache" / "japan-android"
+        extracted_dir.mkdir(parents=True)
+        (extracted_dir / "member.bundle").write_bytes(b"whatever")
+
+        def fake_fetch(session, db_path, force=False, check_interval=None):
+            save_game_files(db_path, get_table_name("japan-android"), [
+                ("Pack_keep.zip", "https://jp/Pack_keep.zip", "crc32",
+                 str(zlib.crc32(b"KEEP") & 0xFFFFFFFF), 4, "[]"),
+                # Pack_stale.zip's catalog row is gone entirely
+            ])
+            return {"japan-android": True, "japan-windows": False}
+
+        with patch('bagfd.client.fetch_japan_servers', side_effect=fake_fetch):
+            c.update(platform='japan-android')
+
+        assert (zip_dir / "Pack_keep.zip").exists()          # hash-verified, still valid
+        assert not (zip_dir / "Pack_stale.zip").exists()     # gone from catalog, evicted
+        # Extracted individual files aren't catalog-tracked on their own;
+        # cheaper to just clear them and let extraction from the (now-valid)
+        # zip cache repopulate them.
+        assert not (extracted_dir / "member.bundle").exists()
+
+    def test_no_catalog_change_leaves_cache_untouched(self, tmp_path):
+        c = BlueArchiveGameFilesDownloader(data_dir=tmp_path)
+        _seed_versions(c.db_path)
+
+        cache_dir = c.data_dir / "download_cache" / "global-android"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "untouched.bundle").write_bytes(b"DATA")
+
+        with patch('bagfd.client.fetch_global_android', return_value=False):
+            c.update(platform='global-android')
+
+        assert (cache_dir / "untouched.bundle").exists()
 
 
 # ---------------------------------------------------------------------------

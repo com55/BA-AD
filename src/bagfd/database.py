@@ -7,7 +7,9 @@ import logging
 import shutil
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Optional, Dict
+from typing import TYPE_CHECKING, Optional, Dict, Tuple
+
+from .downloader import _hash_matches
 
 if TYPE_CHECKING:
     from .downloader import PathLockManager
@@ -95,6 +97,18 @@ def init_database(db_path: Path) -> None:
                 bundle_files TEXT
             )
         """)
+
+    # Caches the API URL decrypted from the Japan XAPK, keyed to the app
+    # version it was extracted from — lets a same-version recheck skip
+    # re-downloading the (large) XAPK while still hitting the live API each
+    # time to pick up hotfix bundles pushed without a version bump.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS japan_api_cache (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            version TEXT NOT NULL,
+            api_url TEXT NOT NULL
+        )
+    """)
 
     conn.commit()
     conn.close()
@@ -205,6 +219,41 @@ def update_version(db_path: Path, platform: str, version: str, is_new_version: b
     conn.close()
 
 
+def get_cached_japan_api_url(db_path: Path) -> Optional[Tuple[str, str]]:
+    """Get the cached Japan API URL and the version it was extracted for.
+
+    Args:
+        db_path: Path to the SQLite database.
+
+    Returns:
+        ``(version, api_url)``, or None if nothing is cached yet.
+    """
+    conn = _connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT version, api_url FROM japan_api_cache WHERE id = 1")
+    result = cursor.fetchone()
+    conn.close()
+    return (result[0], result[1]) if result else None
+
+
+def set_cached_japan_api_url(db_path: Path, version: str, api_url: str) -> None:
+    """Cache the Japan API URL extracted from the XAPK for ``version``.
+
+    Args:
+        db_path: Path to the SQLite database.
+        version: App version the API URL was extracted from.
+        api_url: Decrypted API URL.
+    """
+    conn = _connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR REPLACE INTO japan_api_cache (id, version, api_url)
+        VALUES (1, ?, ?)
+    """, (version, api_url))
+    conn.commit()
+    conn.close()
+
+
 def set_defer(db_path: Path, platform: str, until: datetime) -> None:
     """Defer ``platform``'s next version check until ``until``.
 
@@ -268,6 +317,56 @@ def clear_cache_for_platform(
     for entry in platform_cache.iterdir():
         _remove_cache_entry(entry, locks)
     logger.info(f"Cache cleared: {platform}")
+
+
+def prune_stale_cache(
+    cache_dir: Path,
+    platform: str,
+    valid_hashes: Dict[str, Tuple[str, str]],
+    locks: "PathLockManager | None" = None,
+) -> None:
+    """Remove cached files under ``cache_dir/<platform>/`` no longer valid.
+
+    Unlike `clear_cache_for_platform` (which wipes everything), this keeps any
+    cached file whose name is still in ``valid_hashes`` *and* whose on-disk
+    hash still matches — so a catalog refresh only evicts the files that
+    actually changed or dropped out, not the whole cache.
+
+    Args:
+        cache_dir: Base cache directory path.
+        platform: Platform identifier.
+        valid_hashes: Map of cache filename -> (hash_type, hash_value) built
+            from the current catalog rows.
+        locks: Optional `PathLockManager`, passed through to skip files
+            another client/thread currently holds (see `clear_cache_for_platform`).
+    """
+    platform_cache = cache_dir / platform
+    if not platform_cache.exists():
+        return
+    for entry in platform_cache.iterdir():
+        if not entry.is_file():
+            continue
+        _prune_cache_entry(entry, valid_hashes.get(entry.name), locks)
+
+
+def _prune_cache_entry(
+    entry: Path, valid: Optional[Tuple[str, str]], locks: "PathLockManager | None"
+) -> None:
+    """Delete ``entry`` unless it's still listed in the catalog with a matching hash.
+
+    Hashing happens inside the same lock used for deletion, so a file a
+    downloader is actively writing is skipped rather than hashed mid-write.
+    """
+    if locks is not None:
+        with locks.try_lock(entry) as acquired:
+            if not acquired:
+                logger.debug(f"Skipped in-use cache file: {entry.name}")
+                return
+            if valid is None or not _hash_matches(entry, valid[0], valid[1]):
+                _delete_cache_entry(entry)
+    else:
+        if valid is None or not _hash_matches(entry, valid[0], valid[1]):
+            _delete_cache_entry(entry)
 
 
 def _remove_cache_entry(entry: Path, locks: "PathLockManager | None") -> None:

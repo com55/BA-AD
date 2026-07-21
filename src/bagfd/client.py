@@ -40,6 +40,7 @@ from .database import (
     get_game_files,
     get_table_name,
     init_database,
+    prune_stale_cache,
 )
 from .downloader import DownloadItem, PathLockManager, download_files
 from .enums import FilterMethod, Platform, VerifyMethod
@@ -311,9 +312,10 @@ class BlueArchiveGameFilesDownloader:
     def update(self, force: bool = False, platform="all", cache_dir: Path | None = None) -> None:
         """Refresh the file catalog for one or all platforms.
 
-        When a new game version is detected, the stale caches for that platform
-        are cleared (zip cache, the default download cache, and ``cache_dir`` if
-        given).
+        When the catalog changes (new version, or a same-version content
+        change such as a hotfix), stale caches for that platform are pruned:
+        any cached file no longer in the catalog, or whose hash no longer
+        matches, is removed; files still valid are kept.
 
         Args:
             force: Fetch even if the catalog was checked recently.
@@ -323,7 +325,7 @@ class BlueArchiveGameFilesDownloader:
         """
         for p in self._resolve_platforms(platform):
             if self._fetch_platform(p, force):
-                self._invalidate(p, cache_dir)
+                self._prune_stale_cache(p, cache_dir)
 
     def clean(self, platform="all", cache_dir: Path | None = None) -> None:
         """Remove cached files and catalog rows for one or all platforms.
@@ -365,19 +367,19 @@ class BlueArchiveGameFilesDownloader:
             raise TooManyFilesError(len(matches), max_files)
 
     def _fetch_platform(self, platform: str, force: bool) -> bool:
-        """Refresh the catalog for one platform; return True if a new version."""
+        """Refresh the catalog for one platform; return True if the catalog changed."""
         if platform == Platform.GLOBAL_ANDROID:
             return fetch_global_android(self.session, self.db_path, force)
         results = fetch_japan_servers(self.session, self.db_path, force)
         return bool(results.get(platform))
 
     def _ensure_fresh(self, platform: str, cache_dir: Path | None = None, background: bool = False) -> None:
-        """Refresh the catalog if due, invalidating caches on a new version."""
+        """Refresh the catalog if due, pruning caches on a catalog change."""
         if background:
             self._ensure_fresh_background(platform, cache_dir)
             return
         if self._fetch_platform(platform, force=False):
-            self._invalidate(platform, cache_dir)
+            self._prune_stale_cache(platform, cache_dir)
 
     def _ensure_fresh_background(self, platform: str, cache_dir: Path | None = None) -> None:
         """Refresh the catalog on a daemon thread; returns immediately.
@@ -392,7 +394,7 @@ class BlueArchiveGameFilesDownloader:
         def run() -> None:
             try:
                 if self._fetch_platform(platform, force=False):
-                    self._invalidate(platform, cache_dir)
+                    self._prune_stale_cache(platform, cache_dir)
             except Exception:
                 logger.exception(f"Background catalog update failed for {platform}")
             finally:
@@ -401,8 +403,51 @@ class BlueArchiveGameFilesDownloader:
         threading.Thread(target=run, name=f"bagfd-update-{platform}", daemon=True).start()
 
     def _invalidate(self, platform: str, cache_dir: Path | None = None) -> None:
-        """Clear cached files for ``platform`` across all cache locations."""
+        """Clear cached files for ``platform`` across all cache locations.
+
+        Blanket clear — used by `clean()`, which drops the catalog rows right
+        after, so there's nothing to diff against. Catalog-refresh paths use
+        `_prune_stale_cache` instead, which keeps files still valid.
+        """
         clear_cache_for_platform(self.zip_cache, platform, self._file_locks)
+        clear_cache_for_platform(self.data_dir / "download_cache", platform, self._file_locks)
+        if cache_dir is not None:
+            clear_cache_for_platform(Path(cache_dir), platform, self._file_locks)
+
+    def _valid_hashes(self, table_name: str, basename: bool) -> dict[str, tuple[str, str]]:
+        """Map cache filename -> (hash_type, hash_value) from current catalog rows.
+
+        Args:
+            table_name: Catalog table to read.
+            basename: Global's catalog `path` includes a directory prefix
+                (e.g. ``Android/aa/xyz.bundle``) but cache files are named by
+                basename only; Japan's `path` (the pack name) already matches
+                the cache filename directly.
+        """
+        rows = get_game_files(self.db_path, table_name)
+        if basename:
+            return {path.split('/')[-1]: (hash_type, hash_value) for path, _url, hash_type, hash_value, _size, _bf in rows}
+        return {path: (hash_type, hash_value) for path, _url, hash_type, hash_value, _size, _bf in rows}
+
+    def _prune_stale_cache(self, platform: str, cache_dir: Path | None = None) -> None:
+        """Prune caches after a catalog change, keeping files still valid.
+
+        Global / Japan zip packs are hash-verified against the current catalog
+        row for their path — a file whose hash still matches survives. Japan's
+        extracted individual files aren't catalog-tracked on their own (only
+        the pack they came from is), and re-extracting from an already-valid
+        zip is cheap, so that tier is cleared outright instead.
+        """
+        table_name = get_table_name(platform)
+        if platform == Platform.GLOBAL_ANDROID:
+            valid = self._valid_hashes(table_name, basename=True)
+            prune_stale_cache(self.data_dir / "download_cache", platform, valid, self._file_locks)
+            if cache_dir is not None:
+                prune_stale_cache(Path(cache_dir), platform, valid, self._file_locks)
+            return
+
+        valid = self._valid_hashes(table_name, basename=False)
+        prune_stale_cache(self.zip_cache, platform, valid, self._file_locks)
         clear_cache_for_platform(self.data_dir / "download_cache", platform, self._file_locks)
         if cache_dir is not None:
             clear_cache_for_platform(Path(cache_dir), platform, self._file_locks)

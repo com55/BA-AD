@@ -196,3 +196,48 @@ class TestInvalidationSkipsInUseFiles:
         clear_cache_for_platform(tmp_path / "zip_cache", "japan-android", mgr)
 
         assert list(plat_dir.iterdir()) == []
+
+
+class TestPruneStaleCache:
+    """prune_stale_cache must keep files whose catalog entry+hash still match
+    and evict everything else (dropped from the catalog, or hash-mismatched)."""
+
+    def test_keeps_valid_removes_mismatch_and_orphan(self, tmp_path):
+        from bagfd.database import prune_stale_cache
+
+        plat_dir = tmp_path / "cache" / "global-android"
+        plat_dir.mkdir(parents=True)
+        valid = plat_dir / "valid.bundle"
+        valid.write_bytes(b"KEEP")
+        stale_hash = plat_dir / "stale_hash.bundle"
+        stale_hash.write_bytes(b"OLD")
+        orphan = plat_dir / "orphan.bundle"
+        orphan.write_bytes(b"GONE")
+
+        valid_hashes = {
+            "valid.bundle": ("md5", hashlib.md5(b"KEEP").hexdigest()),
+            "stale_hash.bundle": ("md5", hashlib.md5(b"NEW").hexdigest()),  # on-disk content is stale
+            # orphan.bundle intentionally has no catalog row
+        }
+
+        prune_stale_cache(tmp_path / "cache", "global-android", valid_hashes)
+
+        assert valid.exists()
+        assert not stale_hash.exists()
+        assert not orphan.exists()
+
+    def test_skips_locked_file_keeps_it(self, tmp_path):
+        from bagfd.database import prune_stale_cache
+
+        mgr = PathLockManager(tmp_path / "locks")
+        plat_dir = tmp_path / "cache" / "global-android"
+        plat_dir.mkdir(parents=True)
+        busy = plat_dir / "busy.bundle"
+        busy.write_bytes(b"BUSY")
+
+        # No catalog entry -> would normally be pruned, but it's held locked
+        # (simulates a concurrent downloader/extractor).
+        with mgr.lock(busy):
+            prune_stale_cache(tmp_path / "cache", "global-android", {}, mgr)
+
+        assert busy.exists()
