@@ -53,6 +53,38 @@ class TestExtractGameMainFromResources:
         )
         assert extract_game_main_from_resources(blob) == "https://example.yostar/server-info.json"
 
+    def test_full_pattern_branch_reads_size_from_blob(self):
+        """When GAME_CONFIG_PATTERN matches, size must be unpacked from the blob."""
+        import json
+
+        import bagfd.yostar as yostar
+
+        url = "https://size-from-blob.example/api"
+        config = _server_info_config(url)
+        # Grow JSON until the XOR'd UTF-16 payload is exactly 0x392 bytes so the
+        # 20-byte GAME_CONFIG_PATTERN (marker + that size) matches in the blob.
+        pad = 0
+        while True:
+            padded = {**config, "_": "x" * pad}
+            if len(json.dumps(padded, separators=(",", ":"))) * 2 == 0x392:
+                config = padded
+                break
+            pad += 1
+            assert pad < 500
+
+        blob = _build_resources_asset(config)
+        assert blob.find(yostar.GAME_CONFIG_PATTERN) >= 0
+
+        real_unpack = struct.unpack_from
+
+        def spy(fmt, buffer, offset=0):
+            if buffer == yostar.GAME_CONFIG_PATTERN:
+                raise AssertionError("size must be read from blob, not GAME_CONFIG_PATTERN")
+            return real_unpack(fmt, buffer, offset)
+
+        with patch.object(yostar.struct, "unpack_from", spy):
+            assert extract_game_main_from_resources(blob) == url
+
     def test_missing_pattern_raises(self):
         with pytest.raises(ValueError, match="GameMainConfig"):
             extract_game_main_from_resources(b"nope")

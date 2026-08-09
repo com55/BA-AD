@@ -157,7 +157,9 @@ def extract_game_main_from_resources(blob: bytes) -> str:
     """Find GameMainConfig in a resources.assets blob and return ServerInfoDataUrl."""
     pos = blob.find(GAME_CONFIG_PATTERN)
     if pos >= 0:
-        size = struct.unpack_from("<i", GAME_CONFIG_PATTERN, len(GAME_CONFIG_PATTERN) - 4)[0]
+        # Size is i32le at marker+16 in the blob — never from the pattern constant,
+        # which only embeds a historical sample size (0x392).
+        size = struct.unpack_from("<i", blob, pos + 16)[0]
         data_start = pos + len(GAME_CONFIG_PATTERN)
     else:
         marker = b"GameMainConfig\x00\x00"

@@ -419,9 +419,13 @@ def fetch_japan_servers(session: requests.Session, db_path: Path,
                 results[platform_name] = False
             return results
 
-    # Update version info for all platforms
+    # Update version info only for platforms that were actually due this run.
+    # Touching last_check on a non-due platform would reset its check interval
+    # without having performed a real check.
     if current_version:
         for platform_name in japan_platforms:
+            if not due.get(platform_name):
+                continue
             update_version(db_path, platform_name, current_version, results[platform_name])
 
     return {
