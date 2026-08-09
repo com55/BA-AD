@@ -247,23 +247,23 @@ def fetch_japan_servers(session: requests.Session, db_path: Path,
     Re-fetches and rewrites the catalog rows for both Japan platforms every
     time a check is due (per ``check_interval``/``force``) — not only when the
     app version changes — so a hotfix bundle pushed under the same version is
-    still picked up. The XAPK is only re-downloaded and decrypted when the app
-    version changes (or ``force``); at an unchanged version the cached API URL
-    is reused, but the live catalog lookup through it still runs every time,
-    since that's where a same-version hotfix would surface. Does not touch any
-    download cache — cache invalidation is the caller's responsibility.
+    still picked up.
+
+    When the catalog API URL must be refreshed (version change or ``force``),
+    the YoStar launcher ``resources.assets`` path is tried first (~60MB). If
+    that fails, the legacy PureAPK + XAPK extract (~200MB) is used as fallback.
+    At an unchanged version the cached API URL is reused, but the live catalog
+    lookup through it still runs every due check.
 
     If the catalog can't be fetched (e.g. the server is mid version-update and
     returns an empty body or an error), the cached catalog is kept untouched and
-    the next check is deferred by ``defer_on_failure`` rather than raising — so a
-    transient maintenance window degrades to serving the previous version
-    instead of failing the whole conversion.
+    the next check is deferred by ``defer_on_failure`` rather than raising.
 
     Args:
         session: Requests session with proper headers configured.
         db_path: Path to the SQLite database.
         force: Force fetch regardless of version check interval. Also forces a
-            fresh XAPK download/decrypt instead of reusing a cached API URL.
+            fresh server-info resolve instead of reusing a cached API URL.
         check_interval: Version check interval (uses default if None).
         defer_on_failure: How long to keep serving the cached catalog before
             re-attempting, when a fetch fails (default 10 minutes).
@@ -272,81 +272,81 @@ def fetch_japan_servers(session: requests.Session, db_path: Path,
         Dict mapping each Japan platform name to whether its catalog changed
         (new version or a same-version content change).
     """
+    from .yostar import resolve_japan_server_info_url
+
     if check_interval is None:
         check_interval = timedelta(hours=4)
-
-    PUREAPK_JAPAN_URL = "https://api.pureapk.com/m/v3/cms/app_version?hl=en-US&package_name=com.YostarJP.BlueArchive"
 
     results = {}
     due = {}
     catalog_changed = {}
     current_version = None
+    resolved_api_url = None
 
     japan_platforms = ["japan-android", "japan-windows"]
 
-    # Check versions for both platforms
     for platform_name in japan_platforms:
         if not should_check_version(db_path, platform_name, force, check_interval):
             logger.debug(f"Skipped {platform_name} (checked recently)")
             results[platform_name] = False
             due[platform_name] = False
             continue
-
         logger.info(f"Checking {platform_name}...")
+        results[platform_name] = False
         due[platform_name] = True
 
-        if not current_version:
-            response = session.get(PUREAPK_JAPAN_URL)
-            response.raise_for_status()
-
-            version_pattern = re.compile(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)')
-            match = version_pattern.search(response.text)
-
-            if not match:
-                raise ValueError("Could not extract version from PureAPK Japan")
-
-            current_version = match.group(0)
-
-        stored_version = get_stored_version(db_path, platform_name)
-        is_new_version = current_version != stored_version
-
-        if is_new_version:
-            logger.info(f"New version: {stored_version} → {current_version}")
-        else:
-            logger.info(f"Version unchanged: {current_version}")
-
-        results[platform_name] = is_new_version
-
-    # Re-check the catalog whenever either platform is due, regardless of
-    # whether the version changed.
+    # Re-check the catalog whenever either platform is due.
     if any(due.values()) or force:
         try:
+            from .yostar import get_yostar_base_config
+
             cached = get_cached_japan_api_url(db_path)
-            if not force and cached and cached[0] == current_version:
-                api_url = cached[1]
-                logger.info("Reusing cached API URL for version %s", current_version)
-            else:
-                logger.info("Downloading Japan APK...")
+            need_fresh_api = force or not cached
 
-                response = session.get(PUREAPK_JAPAN_URL)
-                url_pattern = re.compile(
-                    r'(X?APKJ)..(https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*))'
+            if need_fresh_api:
+                logger.info(
+                    "Resolving Japan server info "
+                    "(YoStar resources.assets, XAPK fallback)..."
                 )
-                url_match = url_pattern.search(response.text)
-
-                if not url_match or len(url_match.groups()) < 2:
-                    raise ValueError("Could not extract APK URL")
-
-                download_url = url_match.group(2)
-                logger.info("Downloading XAPK...")
-
-                xapk_data = BytesIO(session.get(download_url, stream=True).content)
-                logger.info("Extracting config...")
-                api_url = _extract_japan_api_url(session, xapk_data)
+                current_version, api_url = resolve_japan_server_info_url(session)
                 set_cached_japan_api_url(db_path, current_version, api_url)
+                resolved_api_url = api_url
+            else:
+                try:
+                    current_version = get_yostar_base_config(session)["game_latest_version"]
+                except Exception as exc:
+                    logger.warning(
+                        "YoStar version check failed (%s); using cached version %s",
+                        exc, cached[0],
+                    )
+                    current_version = cached[0]
+
+                if cached[0] == current_version:
+                    api_url = cached[1]
+                    logger.info("Reusing cached API URL for version %s", current_version)
+                    resolved_api_url = api_url
+                else:
+                    logger.info(
+                        "Version changed %s → %s; refreshing server info...",
+                        cached[0], current_version,
+                    )
+                    current_version, api_url = resolve_japan_server_info_url(session)
+                    set_cached_japan_api_url(db_path, current_version, api_url)
+                    resolved_api_url = api_url
+
+            for platform_name in japan_platforms:
+                if not due.get(platform_name):
+                    continue
+                stored_version = get_stored_version(db_path, platform_name)
+                is_new_version = current_version != stored_version
+                if is_new_version:
+                    logger.info(f"New version: {stored_version} → {current_version}")
+                else:
+                    logger.info(f"Version unchanged: {current_version}")
+                results[platform_name] = is_new_version
 
             logger.info("Fetching catalogs...")
-            addressable_resp = session.get(api_url)
+            addressable_resp = session.get(resolved_api_url)
             addressable_resp.raise_for_status()
             addressable = addressable_resp.json()
             connection_groups = addressable.get("ConnectionGroups", [])
@@ -355,11 +355,15 @@ def fetch_japan_servers(session: requests.Session, db_path: Path,
 
             override_groups = connection_groups[0].get("OverrideConnectionGroups", [])
             if len(override_groups) < 2:
-                raise ValueError(f"Expected at least 2 OverrideConnectionGroups, got {len(override_groups)}")
+                raise ValueError(
+                    f"Expected at least 2 OverrideConnectionGroups, got {len(override_groups)}"
+                )
 
             catalog_url = override_groups[1].get("AddressablesCatalogUrlRoot", "")
             if not catalog_url:
-                raise ValueError("AddressablesCatalogUrlRoot not found or empty in OverrideConnectionGroups[1]")
+                raise ValueError(
+                    "AddressablesCatalogUrlRoot not found or empty in OverrideConnectionGroups[1]"
+                )
 
             # Process both platforms
             for platform_name in japan_platforms:

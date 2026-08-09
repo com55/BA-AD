@@ -272,8 +272,11 @@ class TestQueryUpdateBackground:
 
     def test_background_thread_populates_empty_catalog(self, tmp_path):
         client = BlueArchiveGameFilesDownloader(data_dir=tmp_path)
+        release = threading.Event()
 
         def fake_fetch(session, db_path, force=False, check_interval=None):
+            # Stay blocked until the caller has asserted the first (empty) query.
+            assert release.wait(timeout=2)
             _seed_global(db_path)
             update_version(db_path, 'global-android', '1.0.0', is_new_version=True)
             return True
@@ -281,6 +284,7 @@ class TestQueryUpdateBackground:
         with patch('bagfd.client.fetch_global_android', side_effect=fake_fetch):
             results = client.query('ch0230', platform='global-android', update_background=True)
             assert results == []
+            release.set()
 
             lock = client._update_locks['global-android']
             assert lock.acquire(timeout=2)
