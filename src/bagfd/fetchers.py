@@ -148,7 +148,9 @@ def fetch_global_android(session: requests.Session, db_path: Path,
         check_interval = timedelta(hours=4)
     
     GLOBAL_API_URL = "https://api-pub.nexon.com/patch/v1.1/version-check"
-    PUREAPK_GLOBAL_URL = "https://api.pureapk.com/m/v3/cms/app_version?hl=en-US&package_name=com.nexon.bluearchive"
+    # PureAPK now Cloudflare-challenges non-browser requests (503). Switched to
+    # Apptopia's Play Store listing page, same approach upstream BA-AD took.
+    GLOBAL_VERSION_URL = "https://apptopia.com/google-play/app/com.nexon.bluearchive/about"
     
     platform = "global-android"
     
@@ -158,15 +160,15 @@ def fetch_global_android(session: requests.Session, db_path: Path,
     
     logger.info(f"Fetching {platform}...")
     
-    # Get version from PureAPK
-    response = session.get(PUREAPK_GLOBAL_URL)
+    # Get version from Apptopia's Play Store listing
+    response = session.get(GLOBAL_VERSION_URL)
     response.raise_for_status()
     
     version_pattern = re.compile(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)')
     match = version_pattern.search(response.text)
     
     if not match:
-        raise ValueError("Could not extract version from PureAPK")
+        raise ValueError("Could not extract version from Apptopia")
     
     version = match.group(0)
     stored_version = get_stored_version(db_path, platform)
